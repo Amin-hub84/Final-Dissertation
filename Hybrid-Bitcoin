@@ -1,0 +1,134 @@
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import time
+import cryptocompare
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import xgboost as xgb
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from statsmodels.tsa.arima.model import ARIMA
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# Step 1: Download Bitcoin price data with retry mechanism
+def download_btc_data():
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            print(f"Attempt {attempt + 1} to download BTC data...")
+            btc_data = yf.download('BTC-USD', start='2018-01-01', end='2024-03-01')
+            if not btc_data.empty:
+                print("Data successfully downloaded.")
+                return btc_data
+            else:
+                print("No data received, retrying...")
+        except Exception as e:
+            print(f"Error downloading data: {e}, retrying...")
+        time.sleep(5)  # Wait before retrying
+
+    print("Failed to download data from Yahoo Finance.")
+    return None
+
+btc_data = download_btc_data()
+
+# If Yahoo Finance fails, use alternative source (CryptoCompare)
+if btc_data is None or btc_data.empty:
+    print("Trying alternative source: CryptoCompare")
+    data = cryptocompare.get_historical_price_day('BTC', currency='USD', limit=365)
+    
+    if data:
+        btc_data = pd.DataFrame(data)
+        btc_data['time'] = pd.to_datetime(btc_data['time'], unit='s')
+        btc_data.set_index('time', inplace=True)
+        btc_data.rename(columns={'close': 'Close'}, inplace=True)
+        print("CryptoCompare data successfully retrieved.")
+    else:
+        raise ValueError("Failed to download Bitcoin data from all sources.")
+
+# Ensure only Close price is used
+btc_data = btc_data[['Close']]
+btc_data.dropna(inplace=True)
+
+# Step 2: Data Preprocessing
+scaler = MinMaxScaler(feature_range=(0, 1))
+btc_scaled = scaler.fit_transform(btc_data)
+
+# Function to create time series sequences
+def create_sequences(data, seq_length=60):
+    X, y = [], []
+    for i in range(len(data) - seq_length):
+        X.append(data[i:i + seq_length])
+        y.append(data[i + seq_length])
+    return np.array(X), np.array(y)
+
+seq_length = 60
+X, y = create_sequences(btc_scaled, seq_length)
+
+# Split into train and test sets
+split_index = int(0.8 * len(X))
+X_train, X_test = X[:split_index], X[split_index:]
+y_train, y_test = y[:split_index], y[split_index:]
+
+# Step 3: ARIMA Model
+def train_arima(data, order=(5,1,0)):
+    try:
+        model = ARIMA(data, order=order)
+        model_fit = model.fit()
+        return model_fit
+    except Exception as e:
+        print(f"ARIMA model training error: {e}")
+        return None
+
+arima_model = train_arima(btc_data['Close'].values)
+
+# Step 4: XGBoost Model
+xgb_model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100, learning_rate=0.05)
+xgb_model.fit(X_train.reshape(X_train.shape[0], -1), y_train)
+
+# Step 5: LSTM Model
+lstm_model = Sequential([
+    LSTM(50, return_sequences=True, input_shape=(seq_length, 1)),
+    Dropout(0.2),
+    LSTM(50, return_sequences=False),
+    Dropout(0.2),
+    Dense(25),
+    Dense(1)
+])
+
+lstm_model.compile(optimizer='adam', loss='mean_squared_error')
+lstm_model.fit(X_train, y_train, epochs=20, batch_size=32, validation_data=(X_test, y_test), verbose=1)
+
+# Step 6: Hybrid LSTM-XGBoost Model
+lstm_predictions = lstm_model.predict(X_train)
+xgb_lstm_model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100, learning_rate=0.05)
+xgb_lstm_model.fit(lstm_predictions, y_train)
+
+# Step 7: Model Evaluation
+def evaluate_model(model_name, y_true, y_pred):
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    print(f"{model_name} - MAE: {mae:.2f}, RMSE: {rmse:.2f}")
+
+arima_preds = arima_model.forecast(len(y_test)) if arima_model else np.zeros(len(y_test))
+xgb_preds = xgb_model.predict(X_test.reshape(X_test.shape[0], -1))
+lstm_preds = lstm_model.predict(X_test)
+xgb_lstm_preds = xgb_lstm_model.predict(lstm_preds)
+
+evaluate_model("ARIMA", y_test, arima_preds)
+evaluate_model("XGBoost", y_test, xgb_preds)
+evaluate_model("LSTM", y_test, lstm_preds.flatten())
+evaluate_model("LSTM+XGBoost", y_test, xgb_lstm_preds)
+
+# Step 8: Plot Results
+plt.figure(figsize=(14, 6))
+plt.plot(y_test, label="Actual Prices", linestyle='dashed')
+plt.plot(xgb_lstm_preds, label="LSTM+XGBoost Predictions")
+plt.legend()
+plt.title("Bitcoin Price Prediction")
+plt.show()
